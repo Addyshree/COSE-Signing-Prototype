@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>COSE Signing Prototype - JavaScript</title>
+    <style>
+        /* Modern, clean and mobile-optimized style */
+        body {
+            margin: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0099FF, #66CCFF);
+            color: #fff;
+            min-height: 600px;
+            max-width: 350px;
+            margin-left: auto;
+            margin-right: auto;
+            padding: 20px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        h1,
+        h2 {
+            text-align: center;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        label {
+            display: block;
+            margin-top: 15px;
+            font-weight: 600;
+            font-size: 1rem;
+        }
+
+        textarea,
+        pre {
+            width: 100%;
+            box-sizing: border-box;
+            font-family: monospace;
+            font-size: 0.875rem;
+            padding: 10px;
+            border-radius: 8px;
+            border: none;
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        button {
+            margin-top: 15px;
+            background-color: #005bbb;
+            border: none;
+            color: white;
+            padding: 12px 20px;
+            font-size: 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            width: 100%;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+            transition: background-color 0.3s ease;
+        }
+
+        button:hover {
+            background-color: #003f7f;
+        }
+
+        .status {
+            margin-top: 10px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            min-height: 20px;
+        }
+
+        @media (max-width: 400px) {
+            body {
+                padding: 15px;
+                max-width: 100vw;
+                min-height: 600px;
+            }
+
+            button {
+                padding: 10px 16px;
+                font-size: 0.9rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h1>COSE Signing Prototype</h1>
+    <p style="text-align:center; font-size:0.9rem; margin-bottom:20px;">
+        Prototype for COSE Sign1 operations in JavaScript using Web Crypto API and CBOR encoding.
+    </p>
+
+    <button id="generateKeysBtn">Generate ECDSA P-256 Key Pair</button>
+    <pre id="keyInfo" aria-live="polite" style="background:#004f91;"></pre>
+
+    <label for="payloadInput">Payload (JSON text to sign):</label>
+    <textarea id="payloadInput" rows="4">{ "message": "Hello COSE!" }</textarea>
+
+    <button id="signBtn" disabled>Sign Payload</button>
+    <label for="coseOutput">COSE Sign1 Message (Base64 url):</label>
+    <textarea id="coseOutput" rows="4" readonly></textarea>
+
+    <button id="verifyBtn" disabled>Verify Signature</button>
+    <div class="status" id="verifyStatus" aria-live="polite"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/pxtorem@2.0.0/dist/cbor.min.js"></script>
+    <script>
+        (async () => {
+            // We use the CBOR library from https://github.com/paroga/cbor-js if available as 'CBOR'
+            // For demonstration, fallback minimal CBOR is built-in if necessary
+
+            // Web Crypto API + COSE Sign1 message generation and verification
+
+            // Globals
+            let keyPair = null;
+            let coseMessageBinary = null;
+
+            const generateKeysBtn = document.getElementById('generateKeysBtn');
+            const keyInfo = document.getElementById('keyInfo');
+            const signBtn = document.getElementById('signBtn');
+            const verifyBtn = document.getElementById('verifyBtn');
+            const payloadInput = document.getElementById('payloadInput');
+            const coseOutput = document.getElementById('coseOutput');
+            const verifyStatus = document.getElementById('verifyStatus');
+
+            // Utility: convert ArrayBuffer to base64url
+            function arrayBufferToBase64Url(buffer) {
+                const bytes = new Uint8Array(buffer);
+                let binary = '';
+                for (let b of bytes) {
+                    binary += String.fromCharCode(b);
+                }
+                return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+            }
+            // Utility: base64url to Uint8Array
+            function base64UrlToUint8Array(str) {
+                // Pad with '='
+                let base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+                const pad = base64.length % 4;
+                if (pad) {
+                    base64 += '='.repeat(4 - pad);
+                }
+                const binary = atob(base64);
+                const arr = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    arr[i] = binary.charCodeAt(i);
+                }
+                return arr;
+            }
+
+            // Generate ECDSA P-256 key pair
+            async function generateKeyPair() {
+                keyPair = await crypto.subtle.generateKey(
+                    {
+                        name: "ECDSA",
+                        namedCurve: "P-256"
+                    },
+                    true,
+                    ["sign", "verify"]
+                );
+            }
+
+            // Export keys to JWK for display
+            async function exportKeys() {
+                const pub = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+                const priv = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+                return { pub, priv };
+            }
+
+            // Encode protected header as CBOR map
+            // Algorithm: ES256 = -7 according to COSE spec
+            function createProtectedHeader() {
+                // Protected header is a CBOR-encoded map: {1: -7}
+                // 1 = "alg" label
+                return CBOR.encode(new Map([[1, -7]]));
+            }
+
+            // Create COSE_Sign1 message as per RFC8152
+            // Structure: [ protected: bstr, unprotected: map, payload: bstr or nil, signature: bstr ]
+            // Create Sig_structure: [ "Signature1", protected, external_aad, payload ]
+
+            // external_aad is empty byte string (bstr)
+            async function signMessage(payloadStr, privateKey) {
+                const protectedHeader = createProtectedHeader(); // Uint8Array from CBOR.encode
+                const unprotected = new Map(); // empty map
+
+                // Payload as Uint8Array
+                const encoder = new TextEncoder();
+                const payload = encoder.encode(payloadStr);
+
+                // Sig_structure to be signed: CBOR array ["Signature1", protected, external_aad, payload]
+                // external_aad is empty bstr
+                const externalAad = new Uint8Array(0);
+                const Sig_structure = [
+                    "Signature1",
+                    protectedHeader,
+                    externalAad,
+                    payload
+                ];
+                const Sig_structure_encoded = CBOR.encode(Sig_structure);
+
+                // Sign using Web Crypto API
+                // Signature algorithm: ECDSA with SHA-256
+                const signature = await crypto.subtle.sign(
+                    {
+                        name: "ECDSA",
+                        hash: { name: "SHA-256" }
+                    },
+                    privateKey,
+                    Sig_structure_encoded
+                );
+
+                // COSE_Sign1 message assembly: [protected:bstr, unprotected:map, payload:bstr, signature:bstr]
+                // protected as bstr - we have it as Uint8Array from CBOR.encode
+                // unprotected as empty map (CBOR map, no encoding here because it's part of whole COSE message encoding)
+
+                const coseStructure = [
+                    protectedHeader,
+                    unprotected,
+                    payload,
+                    new Uint8Array(signature)
+                ];
+
+                const coseMessage = CBOR.encode(coseStructure);
+                return coseMessage;
+            }
+
+            async function verifyMessage(coseMsg, publicKey) {
+                // Decode COSE structure (array): [protected,bstr, unprotected,map, payload,bstr, signature,bstr]
+                const decoded = CBOR.decode(coseMsg.buffer || coseMsg);
+                if (!Array.isArray(decoded) || decoded.length !== 4) {
+                    throw new Error("Invalid COSE_Sign1 structure");
+                }
+                const [protectedHeaderRaw, unprotected, payload, signature] = decoded;
+
+                // Decode protected header
+                const protectedHeader = CBOR.decode(protectedHeaderRaw);
+                if (protectedHeader.get(1) !== -7) {
+                    throw new Error("Unsupported algorithm");
+                }
+
+                // Rebuild Sig_structure for verification: ["Signature1", protected, external_aad(bstr empty), payload]
+                const externalAad = new Uint8Array(0);
+
+                const Sig_structure = [
+                    "Signature1",
+                    protectedHeaderRaw,
+                    externalAad,
+                    payload
+                ];
+                const Sig_structure_encoded = CBOR.encode(Sig_structure);
+
+                // Verify signature
+                const valid = await crypto.subtle.verify(
+                    {
+                        name: "ECDSA",
+                        hash: { name: "SHA-256" }
+                    },
+                    publicKey,
+                    signature,
+                    Sig_structure_encoded
+                );
+                return valid;
+            }
+
+            function prettyPrintJwk(jwk) {
+                return JSON.stringify(jwk, null, 2);
+            }
+
+            // Event handlers
+            generateKeysBtn.onclick = async () => {
+                keyInfo.textContent = "Generating key pair...";
+                try {
+                    await generateKeyPair();
+                    const { pub, priv } = await exportKeys();
+                    let infoText = "Public Key (JWK):\n" + prettyPrintJwk(pub) + "\n\n";
+                    infoText += "Private Key (JWK):\n" + prettyPrintJwk(priv);
+                    keyInfo.textContent = infoText;
+                    signBtn.disabled = false;
+                    verifyBtn.disabled = true;
+                    coseOutput.value = "";
+                    verifyStatus.textContent = "";
+                } catch (err) {
+                    keyInfo.textContent = 'Error generating keys: ' + err;
+                    signBtn.disabled = true;
+                }
+            };
+
+            signBtn.onclick = async () => {
+                const payloadStr = payloadInput.value.trim();
+                if (!payloadStr) {
+                    alert("Please enter payload JSON text to sign.");
+                    return;
+                }
+                try {
+                    // Optional: validate JSON
+                    JSON.parse(payloadStr);
+                } catch (e) {
+                    alert("Payload text is not valid JSON.");
+                    return;
+                }
+                signBtn.disabled = true;
+                verifyBtn.disabled = true;
+                coseOutput.value = "... signing ...";
+                verifyStatus.textContent = "";
+                try {
+                    const coseMsg = await signMessage(payloadStr, keyPair.privateKey);
+                    coseMessageBinary = coseMsg;
+                    const b64u = arrayBufferToBase64Url(coseMsg);
+                    coseOutput.value = b64u;
+                    verifyBtn.disabled = false;
+                    signBtn.disabled = false;
+                } catch (err) {
+                    coseOutput.value = "Error signing: " + err.message;
+                    signBtn.disabled = false;
+                }
+            };
+
+            verifyBtn.onclick = async () => {
+                verifyStatus.textContent = "... verifying ...";
+                try {
+                    if (!coseMessageBinary) {
+                        verifyStatus.textContent = "No COSE signature found to verify.";
+                        return;
+                    }
+                    const valid = await verifyMessage(coseMessageBinary, keyPair.publicKey);
+                    verifyStatus.textContent = valid ? "Signature is VALID ✅" : "Signature is INVALID ❌";
+                } catch (err) {
+                    verifyStatus.textContent = "Error verifying signature: " + err.message;
+                }
+            };
+
+        })();
+    </script>
+</body>
+
+</html>
